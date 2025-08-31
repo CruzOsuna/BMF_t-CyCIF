@@ -44,7 +44,7 @@ class SettingsDialog(QDialog):
             "Contrast limits", "Save shapes", "Crop ROI",
             "Count cells", "Export cells", "Metadata",
             "Voronoi", "Save Viewport", "Load points", 
-            "Circle with n cells", "Extract Cells in Shape", "Close all"  # Fixed comma
+            "Circle with n cells", "Extract Cells in Shape","Gating", "Close all"  # Fixed comma
         ]
         
         self.settings = QSettings("MyLab", "NapariTools")
@@ -935,7 +935,88 @@ def on_output_mode_changed(output_mode: str):
 extract_cells_in_shape.label_column.hide()
 extract_cells_in_shape.label_value.hide()
 
+# -------------------------------------------------------------------------------
+# Gating
+# -------------------------------------------------------------------------------
 
+@magicgui(
+    call_button='Gating',
+    layout='vertical'
+)
+def gate_finder(
+    from_gate: int,
+    to_gate:int,
+    increment: float,
+    path_data = Path(),
+    marker_of_interest=""
+):
+    path_data = str(path_data)
+    #Load data
+    adata = sm.pp.mcmicro_to_scimap(path_data, remove_dna = True, log=False, unique_CellId=True, CellId='CellID', split='X_centroid')
+    adata.raw = adata
+    #Maked a copy of the data
+    #bdata = adata.copy()
+    #Generate the dataframe
+    data = pd.DataFrame(adata.raw.X, index=adata.obs.index, columns=adata.var.index)[[marker_of_interest]]
+    #Apply log transform
+    data = np.log1p(data)
+
+    # Generate a dataframe with various gates   
+    def gate(g, d):
+        dd = d.values
+        dd = np.where(dd < g, np.nan, dd)
+        # np.warnings.filterwarnings('ignore')
+        np.seterr('ignore')
+        dd = np.where(dd > g, 1, dd)
+        dd = pd.DataFrame(dd, index=d.index, columns=['gate-' + str(g)])
+        return dd
+    
+    # Identify the list of increments
+    inc = list(np.arange(from_gate, to_gate, increment))
+    inc = [round(num, 3) for num in inc]
+
+    # Apply the function
+    r_gate = lambda x: gate(g=x, d=data)  # Create lamda function
+    gated_data = list(map(r_gate, inc))  # Apply function
+
+    # Concat all the results into a single dataframe
+    gates = pd.concat(gated_data, axis=1)
+
+    # Recover the channel names from adata
+    channel_names = []
+    for layer in viewer.layers:
+        channel_names.append(layer.name)
+
+    # subset the gates to include only the image of interest
+    gates = gates.loc[adata.obs.index,]
+
+    def add_phenotype_layer(adata, gates, phenotype_layer, x, y, viewer):
+        cells = gates[gates[phenotype_layer] == 1].index
+        coordinates = adata[cells]
+        # Flip Y axis if needed
+        coordinates = pd.DataFrame({'y': coordinates.obs[y], 'x': coordinates.obs[x]})
+        # points = coordinates.values.tolist()
+        points = coordinates.values
+        # import time
+        # start = time.time()
+        viewer.add_points(
+            points,
+            size=20,
+            face_color='white',
+            visible=False,
+            name=phenotype_layer,
+        )
+    x_coordinate='X_centroid'
+    y_coordinate='Y_centroid'
+    for i in gates.columns:
+        add_phenotype_layer(
+            adata=adata,
+            gates=gates,
+            phenotype_layer=i,
+            x=x_coordinate,
+            y=y_coordinate,
+            viewer=viewer
+        )
 
 
 # -------------------------------------------------------------------------------
@@ -958,7 +1039,8 @@ widget_map = {
     "Save Viewport": save_viewport,
     "Close all": close_all,
     "Circle with n cells": create_circle_widget,
-    "Extract Cells in Shape": extract_cells_in_shape
+    "Extract Cells in Shape": extract_cells_in_shape,
+    "Gating": gate_finder
 }
 
 # 2. Define tab configuration
@@ -966,7 +1048,7 @@ tab_config = {
     "Input": ["Open image", "Open mask", "Load shapes", "Load points"],
     "Analysis": [
         "Count cells", "Metadata", "Voronoi", 
-        "Circle with n cells", "Extract Cells in Shape"
+        "Circle with n cells", "Extract Cells in Shape", "Gating"
     ],
     "Export": ["Contrast limits", "Save shapes", "Crop ROI", "Save Viewport"],
     "Tools": ["Close all"]
@@ -1029,3 +1111,4 @@ def config_widgets():
 viewer.window.add_dock_widget(config_widgets, area='right')
 
 napari.run()
+
