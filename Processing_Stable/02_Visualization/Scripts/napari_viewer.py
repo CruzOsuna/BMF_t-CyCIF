@@ -217,41 +217,69 @@ def open_mask(mask_path=Path()):
 
 @magicgui(call_button='Load Shapes', layout='vertical', shapes_path={"mode": "d"})
 def load_shapes(shapes_path: Path):
-    """Load shapes from text files with numpy array syntax"""
+    """Load shapes from JSON (new format) or TXT (old format)"""
     shapes_path = Path(shapes_path)
     if not shapes_path.is_dir():
         show_info("Please select a valid directory")
         return
-        
-    for filename in shapes_path.glob("*.txt"):
-        if filename.name.startswith('._'):  # Skip hidden files
+
+    import json, re
+
+    for filename in shapes_path.glob("*"):
+        if filename.name.startswith('._'):  # evitar archivos ocultos
             continue
         try:
-            with open(filename, 'r') as f:
-                content = f.read()
-            
-            # Use regex to parse numpy array syntax
-            match = re.search(r'array\(([\s\S]*?)(?:,\s*dtype=(\w+))?\)', content, re.DOTALL)
-            if not match:
-                raise ValueError("Invalid numpy array format")
-            
-            array_str = match.group(1).strip()
-            dtype_str = match.group(2) if match.group(2) else 'float32'  # Default dtype
-            
-            array_data = ast.literal_eval(array_str)
-            shape_array = np.array(array_data, dtype=getattr(np, dtype_str))
-            
-            viewer.add_shapes(
-                shape_array,
-                shape_type='polygon',
-                edge_width=1,
-                edge_color='#777777',
-                face_color='red',
-                name=filename.stem
-            )
-            
+            if filename.suffix.lower() == ".json":
+                # 🔹 Nuevo formato JSON
+                with open(filename, 'r') as f:
+                    shape_list = json.load(f)
+
+                for shape in shape_list:
+                    s_type = shape.get("type", "polygon")
+                    vertices = np.array(shape.get("vertices", []), dtype=np.float32)
+
+                    if len(vertices) == 0:
+                        continue
+
+                    viewer.add_shapes(
+                        [vertices],
+                        shape_type=s_type,
+                        edge_width=1,
+                        edge_color='#777777',
+                        face_color='red',
+                        name=f"{filename.stem}_{s_type}"
+                    )
+
+                show_info(f"Loaded shapes from {filename.name} (JSON)")
+
+            elif filename.suffix.lower() == ".txt":
+                # 🔹 Formato antiguo con array de NumPy
+                with open(filename, 'r') as f:
+                    content = f.read()
+
+                match = re.search(r'array\(([\s\S]*?)(?:,\s*dtype=(\w+))?\)', content, re.DOTALL)
+                if not match:
+                    raise ValueError("Invalid numpy array format in TXT")
+
+                array_str = match.group(1).strip()
+                dtype_str = match.group(2) if match.group(2) else 'float32'
+                array_data = ast.literal_eval(array_str)
+                shape_array = np.array(array_data, dtype=getattr(np, dtype_str))
+
+                viewer.add_shapes(
+                    shape_array,
+                    shape_type='polygon',  # 🔴 en TXT siempre se guarda como polígono
+                    edge_width=1,
+                    edge_color='#777777',
+                    face_color='red',
+                    name=filename.stem
+                )
+
+                show_info(f"Loaded shapes from {filename.name} (TXT)")
+
         except Exception as e:
             show_info(f"Error loading {filename.name}:\n{str(e)}")
+
 
 
 # -------------------------------------------------------------------------------
@@ -277,11 +305,49 @@ def save_contrast_limits(output_file: Path, ab_list_path=Path(), name=""):
 # -------------------------------------------------------------------------------
 
 
-@magicgui(call_button='Save shape array', layout='vertical', output_file={"mode": "d"})
+@magicgui(call_button='Save shapes', layout='vertical', output_file={"mode": "d"})
 def save_shapes(output_file: Path, shape_name=""):
-    shapes = viewer.layers[shape_name].data
-    with open(output_file / f"{shape_name}.txt", 'w') as output:
-        output.write(repr(shapes))  # Use repr to include dtype information
+    try:
+        if shape_name not in viewer.layers:
+            show_info(f'No shape layer named "{shape_name}" found')
+            return
+
+        shapes_layer = viewer.layers[shape_name]
+        shapes_data = shapes_layer.data          # lista de arrays de vértices
+        shape_types = shapes_layer.shape_type    # lista de tipos de cada shape
+
+        # --------- Guardar en JSON (nuevo formato) ---------
+        save_list = []
+        for shape, s_type in zip(shapes_data, shape_types):
+            save_list.append({
+                "type": s_type,
+                "vertices": shape.tolist()
+            })
+
+        json_path = output_file / f"{shape_name}.json"
+        import json
+        with open(json_path, "w") as f:
+            json.dump(save_list, f, indent=2)
+
+        # --------- Guardar en TXT (formato antiguo, uno por shape) ---------
+        txt_dir = output_file / f"{shape_name}_txt"
+        txt_dir.mkdir(exist_ok=True)
+
+        for i, shape in enumerate(shapes_data):
+            txt_path = txt_dir / f"{shape_name}_{i+1}.txt"
+            with open(txt_path, "w") as f:
+                f.write(repr(np.array(shape, dtype=np.float32)))
+
+        show_info(
+            f"Saved {len(shapes_data)} shapes to:\n"
+            f"- {json_path.name} (JSON)\n"
+            f"- {txt_dir}/ (TXT, {len(shapes_data)} files)"
+        )
+
+    except Exception as e:
+        show_info(f"Error saving shapes: {str(e)}")
+
+
 
 
 
