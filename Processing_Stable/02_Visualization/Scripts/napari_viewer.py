@@ -802,27 +802,29 @@ def create_circle_widget():
 # Widget implementations - Extract Cells in Shape
 # -------------------------------------------------------------------------------
 
+# -------------------------------------------------------------------------------
+# Widget implementations - Extract Cells in Shape (Corregido)
+# -------------------------------------------------------------------------------
+
 @magicgui(
     call_button='Extract Cells in Shape',
     layout='vertical',
     sample={"label": "Sample Name"},
     cell_csv={"label": "Cell Data CSV", "mode": "r", "filter": "*.csv"},
     shape_name={"label": "Shape Layer", "choices": lambda _: [layer.name for layer in viewer.layers if isinstance(layer, Shapes)]},
-    image_layer={"label": "Image Layer", "choices": lambda _: [layer.name for layer in viewer.layers if isinstance(layer, Image)]},
     output_mode={"label": "Output Mode", "choices": ["New CSV", "Add label to existing"]},
-    label_column={"label": "Label Column Name", "visible": False},
-    label_value={"label": "Label Value", "visible": False},
+    label_column={"label": "Column Name", "visible": False},
+    label_value={"label": "Annotation", "visible": False},
     output_dir={"label": "Output Directory", "mode": "d", "visible": True},
-    output_name={"label": "Output Filename", "visible": True}
+    output_name={"label": "New File Name (Optional)", "visible": True}
 )
 def extract_cells_in_shape(
     sample: str,
     cell_csv: Path,
     shape_name: str,
-    image_layer: str,
-    output_mode: str = "New CSV",  # Nuevo parámetro
-    label_column: str = "ROI_Label",  # Nuevo parámetro
-    label_value: str = "Selected",  # Nuevo parámetro
+    output_mode: str = "New CSV",
+    label_column: str = "ROI_Label",
+    label_value: str = "Selected",
     output_dir: Path = Path(),
     output_name: str = ""
 ):
@@ -833,15 +835,16 @@ def extract_cells_in_shape(
             show_info("Cell CSV file not found")
             return
             
-        # Encontrar capas
+        # Encontrar capa de forma
         shape_layer = next((layer for layer in viewer.layers if layer.name == shape_name and isinstance(layer, Shapes)), None)
         if shape_layer is None:
             show_info(f"Shape layer '{shape_name}' not found")
             return
 
-        img_layer = next((layer for layer in viewer.layers if layer.name == image_layer and isinstance(layer, Image)), None)
+        # Obtener automáticamente la primera capa de imagen
+        img_layer = next((layer for layer in viewer.layers if isinstance(layer, Image)), None)
         if img_layer is None:
-            show_info(f"Image layer '{image_layer}' not found")
+            show_info("No image layers found in the viewer")
             return
 
         # Leer CSV completo
