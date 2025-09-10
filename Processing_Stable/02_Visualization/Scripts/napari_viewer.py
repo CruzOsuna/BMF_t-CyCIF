@@ -838,6 +838,7 @@ def create_circle_for_n_cells(
             data=[circle_pts],
             shape_type='polygon',
             edge_color='#ffdd00',
+            edge_width=5,
             face_color='#0000ff22',
             name=final_name,
             scale=(1.0, 1.0),
