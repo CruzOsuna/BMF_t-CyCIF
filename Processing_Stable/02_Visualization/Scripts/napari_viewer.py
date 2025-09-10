@@ -896,37 +896,40 @@ def extract_cells_in_shape(
 ):
     """Extract cell data within specified shape and either save to new CSV or add label to existing"""
     try:
-        # Validar entradas comunes
+        # Validate common inputs
         if not cell_csv.exists():
             show_info("Cell CSV file not found")
             return
             
-        # Encontrar capa de forma
+        # Find shape layer
         shape_layer = next((layer for layer in viewer.layers if layer.name == shape_name and isinstance(layer, Shapes)), None)
         if shape_layer is None:
             show_info(f"Shape layer '{shape_name}' not found")
             return
 
-        # Obtener automáticamente la primera capa de imagen
+        # Automatically get the first image layer
         img_layer = next((layer for layer in viewer.layers if isinstance(layer, Image)), None)
         if img_layer is None:
             show_info("No image layers found in the viewer")
             return
 
-        # Leer CSV completo
-        df = pd.read_csv(cell_csv)
-        required_cols = {'X_centroid', 'Y_centroid', 'CellID', 'Sample'}
-        if not required_cols.issubset(df.columns):
-            missing = required_cols - set(df.columns)
+        # Read only necessary columns for better performance
+        use_cols = ['X_centroid', 'Y_centroid', 'CellID', 'Sample']
+        df = pd.read_csv(cell_csv, usecols=use_cols)
+        
+        # Verify required columns
+        if not all(col in df.columns for col in use_cols):
+            missing = set(use_cols) - set(df.columns)
             show_info(f"Missing columns in CSV: {', '.join(missing)}")
             return
             
-        sample_df = df[df['Sample'] == sample]
+        # Filter by sample early to reduce dataset size
+        sample_df = df[df['Sample'] == sample].copy()
         if len(sample_df) == 0:
             show_info(f"No cells found for sample: {sample}")
             return
 
-        # Obtener dimensiones y factores de escala
+        # Get dimensions and scale factors
         if img_layer.multiscale:
             base_level = img_layer.data[0]
             scale_factor = img_layer.scale[-2:]
@@ -935,20 +938,26 @@ def extract_cells_in_shape(
             scale_factor = img_layer.scale[-2:]
             y_dim, x_dim = img_layer.data.shape[-2:]
 
-        # Crear máscara a partir de la forma
+        # Create mask from shape (once)
         mask = shape_layer.to_labels(labels_shape=(y_dim, x_dim))
 
-        # Verificar qué celdas están dentro de la forma
-        in_shape_mask = []
-        for _, row in sample_df.iterrows():
-            x = int(row['X_centroid'] / scale_factor[1])
-            y = int(row['Y_centroid'] / scale_factor[0])
-            
-            if 0 <= x < x_dim and 0 <= y < y_dim:
-                in_shape_mask.append(mask[y, x] > 0)
-            else:
-                in_shape_mask.append(False)
+        # Convert coordinates to pixels using vectorized operations
+        x_coords = (sample_df['X_centroid'].values / scale_factor[1]).astype(int)
+        y_coords = (sample_df['Y_centroid'].values / scale_factor[0]).astype(int)
+        
+        # Create mask for valid coordinates
+        valid_coords = (x_coords >= 0) & (x_coords < x_dim) & (y_coords >= 0) & (y_coords < y_dim)
+        
+        # Initialize shape mask
+        in_shape_mask = np.zeros(len(sample_df), dtype=bool)
+        
+        # Check which cells are inside the shape (vectorized)
+        if np.any(valid_coords):
+            valid_x = x_coords[valid_coords]
+            valid_y = y_coords[valid_coords]
+            in_shape_mask[valid_coords] = mask[valid_y, valid_x] > 0
 
+        # Filter DataFrame
         filtered_df = sample_df[in_shape_mask]
         cell_count = len(filtered_df)
         
@@ -956,41 +965,49 @@ def extract_cells_in_shape(
             show_info("No cells found within the specified shape")
             return
 
-        # MODO 1: Exportar a nuevo CSV
+        # MODE 1: Export to new CSV
         if output_mode == "New CSV":
             output_path = output_dir / f"{output_name}.csv"
             filtered_df.to_csv(output_path, index=False)
             show_info(f"Saved {cell_count} cells from sample '{sample}' to:\n{output_path}")
         
-        # MODO 2: Añadir etiqueta al CSV existente
+        # MODE 2: Add label to existing CSV
         else:
-            # Validar parámetros de etiqueta
+            # Validate label parameters
             if not label_column:
                 show_info("Please specify a label column name")
                 return
-                
-            # Crear o actualizar columna
-            if label_column not in df.columns:
-                df[label_column] = ""  # Crear nueva columna vacía
-                
-            # Actualizar solo las celdas seleccionadas
-            selected_ids = set(filtered_df['CellID'])
-            mask = df['CellID'].isin(selected_ids) & (df['Sample'] == sample)
-            df.loc[mask, label_column] = label_value
             
-            # Guardar resultados
-            if output_name:  # Guardar como nuevo archivo
+            # Read full file only if necessary
+            if not output_name:  # If we're going to overwrite
+                full_df = pd.read_csv(cell_csv)
+            else:
+                full_df = df  # We already have the necessary columns
+                
+            # Create or update column
+            if label_column not in full_df.columns:
+                full_df[label_column] = ""
+                
+            # Create mask for update
+            selected_ids = set(filtered_df['CellID'])
+            update_mask = full_df['CellID'].isin(selected_ids) & (full_df['Sample'] == sample)
+            
+            # Update only selected cells
+            full_df.loc[update_mask, label_column] = label_value
+            
+            # Save results
+            if output_name:
                 output_path = output_dir / f"{output_name}.csv"
-                df.to_csv(output_path, index=False)
+                full_df.to_csv(output_path, index=False)
                 show_info(f"Added label to {cell_count} cells. Saved as:\n{output_path}")
-            else:  # Sobreescribir original
-                df.to_csv(cell_csv, index=False)
+            else:
+                full_df.to_csv(cell_csv, index=False)
                 show_info(f"Added label to {cell_count} cells in original file")
 
     except Exception as e:
         show_info(f"Error: {str(e)}")
 
-# Conectar cambio de modo para mostrar/ocultar controles
+# Connect mode change to show/hide controls
 @extract_cells_in_shape.output_mode.changed.connect
 def on_output_mode_changed(output_mode: str):
     if output_mode == "Add label to existing":
@@ -1000,7 +1017,7 @@ def on_output_mode_changed(output_mode: str):
         extract_cells_in_shape.label_column.hide()
         extract_cells_in_shape.label_value.hide()
 
-# Configurar visibilidad inicial
+# Set initial visibility
 extract_cells_in_shape.label_column.hide()
 extract_cells_in_shape.label_value.hide()
 
