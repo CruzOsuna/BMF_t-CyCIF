@@ -1,12 +1,12 @@
 ## Dependencies needed
 import napari
-from napari.layers import Shapes
+from napari import Viewer
 from napari.utils.notifications import show_info
 import pandas as pd
 import numpy as np
 import random
-import tifffile as tiff
 import scimap as sm 
+import tifffile
 from tifffile import imread
 import dask.array as da
 import zarr
@@ -30,7 +30,6 @@ from dask_image.imread import imread as daskread
 from io import BytesIO
 import re
 from magicgui.widgets import PushButton
-from napari.layers import Shapes, Image
 
 # Initial configuration
 class SettingsDialog(QDialog):
@@ -44,7 +43,8 @@ class SettingsDialog(QDialog):
             "Contrast limits", "Save shapes", "Crop ROI",
             "Count cells", "Export cells", "Metadata",
             "Voronoi", "Save Viewport", "Load points", 
-            "Circle with n cells", "Extract Cells in Shape","Gating", "Close all"  # Fixed comma
+            "Circle with n cells", "Extract Cells in Shape","Tag cells", 
+            "Gating", "Run phenotype calling", "Close all"  # Fixed comma
         ]
         
         self.settings = QSettings("MyLab", "NapariTools")
@@ -139,7 +139,7 @@ def open_large_image(image_path: Path = Path("."),
                 return
 
         # Load image metadata and data
-        with tiff.TiffFile(image_path) as tf:
+        with tifffile.TiffFile(image_path) as tf:
             series = tf.series[0]
             axes = series.axes
 
@@ -205,7 +205,7 @@ def open_large_image(image_path: Path = Path("."),
 
 @magicgui(call_button='Open mask', layout='vertical')
 def open_mask(mask_path=Path()):
-    seg_m = tiff.imread(mask_path)
+    seg_m = tifffile.imread(mask_path)
     if (len(seg_m.shape) > 2) and (seg_m.shape[0] > 1):
         seg_m = seg_m[0]
     viewer.add_labels(seg_m, name='MASK')
@@ -234,23 +234,31 @@ def load_shapes(shapes_path: Path):
                 with open(filename, 'r') as f:
                     shape_list = json.load(f)
 
+                # Crear listas para todos los shapes del archivo
+                all_shapes = []
+                all_shape_types = []
+                
                 for shape in shape_list:
                     s_type = shape.get("type", "polygon")
                     vertices = np.array(shape.get("vertices", []), dtype=np.float32)
 
                     if len(vertices) == 0:
                         continue
+                    
+                    all_shapes.append(vertices)
+                    all_shape_types.append(s_type)
 
+                if all_shapes:  # Solo agregar si hay shapes válidos
                     viewer.add_shapes(
-                        [vertices],
-                        shape_type=s_type,
+                        all_shapes,
+                        shape_type=all_shape_types,
                         edge_width=1,
                         edge_color='#777777',
                         face_color='red',
-                        name=f"{filename.stem}_{s_type}"
+                        name=filename.stem  # 🔹 SOLO el nombre del archivo sin sufijos
                     )
 
-                show_info(f"Loaded shapes from {filename.name} (JSON)")
+                show_info(f"Loaded {len(all_shapes)} shapes from {filename.name} (JSON)")
 
             elif filename.suffix.lower() == ".txt":
                 # 🔹 Formato antiguo con array de NumPy
@@ -272,7 +280,7 @@ def load_shapes(shapes_path: Path):
                     edge_width=1,
                     edge_color='#777777',
                     face_color='red',
-                    name=filename.stem
+                    name=filename.stem  # 🔹 SOLO el nombre del archivo sin sufijos
                 )
 
                 show_info(f"Loaded shapes from {filename.name} (TXT)")
@@ -280,7 +288,7 @@ def load_shapes(shapes_path: Path):
         except Exception as e:
             show_info(f"Error loading {filename.name}:\n{str(e)}")
 
-
+            
 
 # -------------------------------------------------------------------------------
 # Widget implementations - Save contrast limits
@@ -636,7 +644,7 @@ def save_viewport(
 
         # Save TIFF
         output_path = output_dir / f"{filename}.tiff"
-        tiff.imwrite(output_path, viewport)
+        tifffile.imwrite(output_path, viewport)
         show_info(f"Viewport saved:\n{output_path.name}")
 
     except Exception as e:
@@ -769,7 +777,7 @@ def create_circle_for_n_cells(
         if not cell_info_csv or not cell_info_csv.exists():
             show_info("Please select a valid CSV file")
             return
-            
+        from napari.layers import Shapes, Image    
         img_layer = next((l for l in viewer.layers if isinstance(l, Image)), None)
         if not img_layer:
             show_info("Load an image layer first!")
@@ -870,20 +878,21 @@ def create_circle_widget():
 # -------------------------------------------------------------------------------
 
 # -------------------------------------------------------------------------------
-# Widget implementations - Extract Cells in Shape (Corregido)
+# Widget implementation – Extract Cells in Shape (Fast Optimized Version)
 # -------------------------------------------------------------------------------
+
 
 @magicgui(
     call_button='Extract Cells in Shape',
     layout='vertical',
     sample={"label": "Sample Name"},
     cell_csv={"label": "Cell Data CSV", "mode": "r", "filter": "*.csv"},
-    shape_name={"label": "Shape Layer", "choices": lambda _: [layer.name for layer in viewer.layers if isinstance(layer, Shapes)]},
+    shape_name={"label": "Shape Layer", "choices": lambda _: [ly.name for ly in viewer.layers if isinstance(ly, Shapes)]},
     output_mode={"label": "Output Mode", "choices": ["New CSV", "Add label to existing"]},
     label_column={"label": "Column Name", "visible": False},
     label_value={"label": "Annotation", "visible": False},
-    output_dir={"label": "Output Directory", "mode": "d", "visible": True},
-    output_name={"label": "New File Name (Optional)", "visible": True}
+    output_dir={"label": "Output Directory", "mode": "d"},
+    output_name={"label": "New File Name (Optional)"}
 )
 def extract_cells_in_shape(
     sample: str,
@@ -895,120 +904,79 @@ def extract_cells_in_shape(
     output_dir: Path = Path(),
     output_name: str = ""
 ):
-    """Extract cell data within specified shape and either save to new CSV or add label to existing"""
+    """Extract cell data within a drawn shape, using fast polygon-based filtering."""
     try:
-        # Validate common inputs
+        # 1️⃣ Validación de entradas
         if not cell_csv.exists():
             show_info("Cell CSV file not found")
             return
-            
-        # Find shape layer
-        shape_layer = next((layer for layer in viewer.layers if layer.name == shape_name and isinstance(layer, Shapes)), None)
+
+        shape_layer = next((ly for ly in viewer.layers if ly.name == shape_name and isinstance(ly, Shapes)), None)
         if shape_layer is None:
             show_info(f"Shape layer '{shape_name}' not found")
             return
 
-        # Automatically get the first image layer
-        img_layer = next((layer for layer in viewer.layers if isinstance(layer, Image)), None)
-        if img_layer is None:
-            show_info("No image layers found in the viewer")
+        if not shape_layer.selected_data:
+            show_info("Please select a shape in the Shapes layer.")
             return
 
-        # Read only necessary columns for better performance
+        # 2️⃣ Lectura optimizada del CSV
         use_cols = ['X_centroid', 'Y_centroid', 'CellID', 'Sample']
-        df = pd.read_csv(cell_csv, usecols=use_cols)
-        
-        # Verify required columns
-        if not all(col in df.columns for col in use_cols):
-            missing = set(use_cols) - set(df.columns)
-            show_info(f"Missing columns in CSV: {', '.join(missing)}")
-            return
-            
-        # Filter by sample early to reduce dataset size
-        sample_df = df[df['Sample'] == sample].copy()
-        if len(sample_df) == 0:
+        dtypes = {
+            'X_centroid': 'float32',
+            'Y_centroid': 'float32',
+            'CellID': 'int32',
+            'Sample': 'category'
+        }
+        df = pd.read_csv(cell_csv, usecols=use_cols, dtype=dtypes)
+
+        if sample not in df['Sample'].unique():
             show_info(f"No cells found for sample: {sample}")
             return
 
-        # Get dimensions and scale factors
-        if img_layer.multiscale:
-            base_level = img_layer.data[0]
-            scale_factor = img_layer.scale[-2:]
-            y_dim, x_dim = base_level.shape[-2:]
-        else:
-            scale_factor = img_layer.scale[-2:]
-            y_dim, x_dim = img_layer.data.shape[-2:]
+        sample_df = df[df['Sample'] == sample]
 
-        # Create mask from shape (once)
-        mask = shape_layer.to_labels(labels_shape=(y_dim, x_dim))
+        # 3️⃣ Obtener polígono (solo el primero seleccionado)
+        shape_data = shape_layer.data[next(iter(shape_layer.selected_data))]
+        polygon = Polygon(shape_data[:, [1, 0]])  # (x, y) order para Shapely
 
-        # Convert coordinates to pixels using vectorized operations
-        x_coords = (sample_df['X_centroid'].values / scale_factor[1]).astype(int)
-        y_coords = (sample_df['Y_centroid'].values / scale_factor[0]).astype(int)
-        
-        # Create mask for valid coordinates
-        valid_coords = (x_coords >= 0) & (x_coords < x_dim) & (y_coords >= 0) & (y_coords < y_dim)
-        
-        # Initialize shape mask
-        in_shape_mask = np.zeros(len(sample_df), dtype=bool)
-        
-        # Check which cells are inside the shape (vectorized)
-        if np.any(valid_coords):
-            valid_x = x_coords[valid_coords]
-            valid_y = y_coords[valid_coords]
-            in_shape_mask[valid_coords] = mask[valid_y, valid_x] > 0
-
-        # Filter DataFrame
-        filtered_df = sample_df[in_shape_mask]
+        # 4️⃣ Verificación de pertenencia vectorizada
+        points = MultiPoint(np.column_stack((sample_df['X_centroid'], sample_df['Y_centroid'])))
+        mask = np.fromiter((polygon.contains(p) for p in points), dtype=bool)
+        filtered_df = sample_df.loc[mask]
         cell_count = len(filtered_df)
-        
+
         if cell_count == 0:
             show_info("No cells found within the specified shape")
             return
 
-        # MODE 1: Export to new CSV
+        # 5️⃣ Exportar resultados
         if output_mode == "New CSV":
-            output_path = output_dir / f"{output_name}.csv"
+            output_path = output_dir / f"{output_name or f'{sample}_ROI'}.csv"
             filtered_df.to_csv(output_path, index=False)
             show_info(f"Saved {cell_count} cells from sample '{sample}' to:\n{output_path}")
-        
-        # MODE 2: Add label to existing CSV
-        else:
-            # Validate label parameters
-            if not label_column:
-                show_info("Please specify a label column name")
-                return
-            
-            # Read full file only if necessary
-            if not output_name:  # If we're going to overwrite
-                full_df = pd.read_csv(cell_csv)
-            else:
-                full_df = df  # We already have the necessary columns
-                
-            # Create or update column
+
+        else:  # Add label to existing
+            full_df = pd.read_csv(cell_csv)
             if label_column not in full_df.columns:
                 full_df[label_column] = ""
-                
-            # Create mask for update
+
             selected_ids = set(filtered_df['CellID'])
-            update_mask = full_df['CellID'].isin(selected_ids) & (full_df['Sample'] == sample)
-            
-            # Update only selected cells
-            full_df.loc[update_mask, label_column] = label_value
-            
-            # Save results
-            if output_name:
-                output_path = output_dir / f"{output_name}.csv"
-                full_df.to_csv(output_path, index=False)
-                show_info(f"Added label to {cell_count} cells. Saved as:\n{output_path}")
-            else:
-                full_df.to_csv(cell_csv, index=False)
-                show_info(f"Added label to {cell_count} cells in original file")
+            mask_update = (full_df['Sample'] == sample) & full_df['CellID'].isin(selected_ids)
+            full_df.loc[mask_update, label_column] = label_value
+
+            output_path = output_dir / f"{output_name or cell_csv.stem}_labeled.csv"
+            full_df.to_csv(output_path, index=False)
+            show_info(f"Added label to {cell_count} cells. Saved as:\n{output_path}")
 
     except Exception as e:
         show_info(f"Error: {str(e)}")
 
-# Connect mode change to show/hide controls
+
+# -------------------------------------------------------------------------------
+# Visibilidad dinámica de parámetros
+# -------------------------------------------------------------------------------
+
 @extract_cells_in_shape.output_mode.changed.connect
 def on_output_mode_changed(output_mode: str):
     if output_mode == "Add label to existing":
@@ -1018,9 +986,121 @@ def on_output_mode_changed(output_mode: str):
         extract_cells_in_shape.label_column.hide()
         extract_cells_in_shape.label_value.hide()
 
-# Set initial visibility
+# Estado inicial
 extract_cells_in_shape.label_column.hide()
 extract_cells_in_shape.label_value.hide()
+
+
+# -------------------------------------------------------------------------------
+# Tag cells
+# -------------------------------------------------------------------------------
+
+@magicgui(
+    call_button='Tag cells',
+    layout='vertical', output_dir={"mode": "d"}
+)
+def tag_cells(
+    output_dir: Path,
+    shape_layer_name:str,
+    sample_name:str,
+    tag_column:str,
+    tag:str,
+    file_path = Path(),
+    image_path = Path(),
+    output_name: str = ""
+):
+    from PIL import Image, ImageDraw
+    file_path = str(file_path)
+    image_path = str(image_path)
+
+    #Read data
+    data = pd.read_csv(file_path)
+
+    #Subset data
+    sample_data = data[['X_centroid', 'Y_centroid', 'CellID']][
+        data['Sample'] == sample_name].astype(int)
+
+    #Turn coordenates to list
+    sample_data['tuple'] = list(
+        zip(sample_data['X_centroid'],
+            sample_data['Y_centroid'])
+    )
+    #Load single channel pyramid image
+    tiff = tifffile.TiffFile(image_path)
+    if 'Faas' not in tiff.pages[0].software:
+        if len(tiff.series[0].levels) > 1:
+            dna = [zarr.open(s[0].aszarr(), mode='r') for s in tiff.series[0].levels]
+            dna = [da.from_zarr(z) for z in dna]
+            min_val = dna[-1].min()
+            max_val = dna[-1].max()
+        else:
+            img = tiff.pages[0].asarray()
+            dna = [img[::4**i, ::4**i] for i in range(4)]
+            dna = [da.from_array(z) for z in dna]
+            min_val = dna[-1].min()
+            max_val = dna[-1].max()
+        max_val = max(max_val, min_val + 1)
+        vmin, vmax = da.compute(min_val, max_val)
+    else:  # support legacy OME-TIFF format
+        if len(tiff.series) > 1:
+            dna = [zarr.open(s[0].aszarr()) for s in tiff.series]
+            dna = [da.from_zarr(z) for z in dna]
+            min_val = dna[-1].min()
+            max_val = dna[-1].max()
+        else:
+            img = tiff.pages[0].asarray()
+            dna = [img[::4**i, ::4**i] for i in range(4)]
+            dna = [da.from_array(z) for z in dna]
+            min_val = dna[-1].min()
+            max_val = dna[-1].max()
+        max_val = max(max_val, min_val + 1)
+        vmin, vmax = da.compute(min_val, max_val)
+        
+
+    # create pillow image to convert into boolean mask
+        
+    img = Image.new(
+        'L', (dna[0].shape[1], dna[0].shape[0]))      
+
+    shapes_layer = viewer.layers[shape_layer_name]
+    shape_types = shapes_layer.shape_type
+    vertices = shapes_layer.data
+
+    layer_data = list(zip(shape_types, vertices))
+
+    for shapes, verts in layer_data:
+        # snap any floating point verts to array
+        selection_verts = np.round(verts).astype(int)  
+        vertices = list(zip(selection_verts[:, 1],
+                            selection_verts[:, 0])
+        )
+
+        # update pillow image with polygon
+        ImageDraw.Draw(img).polygon(
+            vertices, outline=1, fill=1)
+
+    # convert pillow image into boolean numpy array
+    ROI_mask = np.array(img, dtype=bool)
+
+    # use numpy fancy indexing to get centroids
+    # where boolean mask is True
+    xs, ys = zip(*sample_data['tuple'])
+    inter1 = ROI_mask[ys, xs]
+    sample_data['inter1'] = inter1
+    idxs_to_tag= list(sample_data['CellID'][sample_data['inter1']])
+
+    # tag cells in column
+
+    if tag_column not in data.columns:
+        data[tag_column] = '' 
+
+    if len(idxs_to_tag) > 0: #for cell_ids in idxs_to_tag.items()
+        global_idx_to_tag = data[(data['Sample'] == sample_name)&
+                            (data['CellID'].isin(idxs_to_tag))].index
+        data.loc[global_idx_to_tag, tag_column] = tag
+
+    output_path = output_dir / f"{output_name}.csv"
+    data.to_csv(output_path, index=False)
 
 # -------------------------------------------------------------------------------
 # Gating
@@ -1107,6 +1187,98 @@ def gate_finder(
 
 
 # -------------------------------------------------------------------------------
+# Phenotype cells
+# -------------------------------------------------------------------------------
+
+@magicgui(
+    call_button='Run phenotype calling',
+    output_directory={"mode": "d"},
+    layout='vertical'
+)
+def phenotype_cells(
+                    phenotype_threshold_percent: int = 0,
+                    phenotype_threshold_abs: int = 0,
+                    phenotype_label: str = "phenotype",
+                    image_ID_column: str = "Sample",
+                    path_data= Path(),
+                    phenotype_key= Path(),
+                    manual_gating =  bool,
+                    gate_value: float = 0.5,
+                    gating_file = Path(),
+                    print_phenotype_proportions: bool = True,
+                    save_phenotype_proportions: bool = True,
+                    sample_name = "",
+                    output_directory: Path = Path(),
+
+):
+    phenotype_key = str(phenotype_key)
+    path_data = str(path_data)
+    gating_file = str(gating_file)
+
+    #Load the data and generate de anndata object
+    adata = sm.pp.mcmicro_to_scimap(path_data, remove_dna = True, 
+                                    log=False, unique_CellId=True, 
+                                    CellId='CellID', split='X_centroid')
+    
+    #Load the phenotype key
+    phenotype = pd.read_csv(phenotype_key, sep = ",")
+    
+    #Load the gating file
+    if manual_gating is False:
+        #Rescale the data
+        adata = sm.pp.rescale(adata, gate = None, imageid = image_ID_column, verbose = True)
+        sm.tl.phenotype_cells(adata, phenotype, gate=gate_value, label=phenotype_label, imageid=image_ID_column, 
+                              pheno_threshold_percent=phenotype_threshold_percent, 
+                              pheno_threshold_abs=phenotype_threshold_abs, verbose=True)
+    else: 
+        manual_gate = pd.read_csv(gating_file, sep = ",")
+        #Rescale the data
+        adata = sm.pp.rescale(adata, gate = manual_gate, imageid = image_ID_column, verbose = True)
+        sm.tl.phenotype_cells(adata, phenotype, gate=gate_value, label=phenotype_label, 
+                              imageid=image_ID_column,pheno_threshold_percent=phenotype_threshold_percent,
+                              pheno_threshold_abs=phenotype_threshold_abs, verbose=True)
+    
+    #Generate csv with cell type proportions
+    a = pd.DataFrame(adata.obs['phenotype'].value_counts())
+    a.reset_index(inplace=True)
+    a = a.rename(columns = {'index':'type'})
+
+    #Print plot with celltype proportions
+    if print_phenotype_proportions is True:
+        # Calculate proportions
+        a["proportion"] = a["count"] / a["count"].sum()
+
+        # Create barplot
+        fig, ax = plt.subplots(figsize=(12, 6))
+        bars = ax.bar(a["phenotype"], a["proportion"], color=plt.cm.tab20.colors)
+
+        # Add labels above bars (show number of cells)
+        for bar, count in zip(bars, a["count"]):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2, height + 0.01,
+                    str(count), ha='center', va='bottom', fontsize=10)
+        # Style
+        ax.set_ylabel("Proportion of cells")
+        ax.set_xlabel("Phenotype")
+        ax.set_title("Phenotype proportions " + sample_name)
+        ax.set_ylim(0, a["proportion"].max() + 0.1)  # some space for labels
+        plt.xticks(rotation=45, ha = "right")
+        plt.tight_layout()
+        plt.show()
+
+    #Save plot and csv file with celltype proportions
+    if save_phenotype_proportions is True:
+        plt.savefig(output_directory / f"{sample_name}_phenotype_proportions.png", dpi=300, bbox_inches="tight")
+        a.to_csv(output_directory / f"{sample_name}_phenotype_proportions.csv", index= False)
+        
+    sm.hl.scimap_to_csv(adata, layer='raw', output_dir=output_directory, 
+                        file_name= sample_name + "_phenotype_annotated", 
+                        CellID='CellID', verbose=True)
+    show_info(
+            f"Phenotype calling complete!"
+        )
+
+# -------------------------------------------------------------------------------
 # Final configuration
 # -------------------------------------------------------------------------------
 
@@ -1127,7 +1299,9 @@ widget_map = {
     "Close all": close_all,
     "Circle with n cells": create_circle_widget,
     "Extract Cells in Shape": extract_cells_in_shape,
-    "Gating": gate_finder
+    "Tag cells": tag_cells,
+    "Gating": gate_finder,
+    "Run phenotype calling": phenotype_cells
 }
 
 # 2. Define tab configuration
@@ -1135,7 +1309,7 @@ tab_config = {
     "Input": ["Open image", "Open mask", "Load shapes", "Load points"],
     "Analysis": [
         "Count cells", "Metadata", "Voronoi", 
-        "Circle with n cells", "Extract Cells in Shape", "Gating"
+        "Circle with n cells", "Extract Cells in Shape", "Tag cells", "Gating", "Run phenotype calling"
     ],
     "Export": ["Contrast limits", "Save shapes", "Crop ROI", "Save Viewport"],
     "Tools": ["Close all"]
