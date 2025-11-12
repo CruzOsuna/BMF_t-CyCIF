@@ -12,6 +12,7 @@ import dask.array as da
 import zarr
 import os
 import ast
+import matplotlib.pyplot as plt
 from pathlib import Path
 from magicgui import magicgui
 from PyQt5.QtWidgets import (
@@ -30,6 +31,8 @@ from dask_image.imread import imread as daskread
 from io import BytesIO
 import re
 from magicgui.widgets import PushButton
+import gudhi as gd
+
 
 # Initial configuration
 class SettingsDialog(QDialog):
@@ -44,7 +47,7 @@ class SettingsDialog(QDialog):
             "Count cells", "Export cells", "Metadata",
             "Voronoi", "Save Viewport", "Load points", 
             "Circle with n cells", "Extract Cells in Shape","Tag cells", 
-            "Gating", "Run phenotype calling", "Close all"  # Fixed comma
+            "Gating", "Run phenotype calling", "Build Rips Complex", "Close all"  # Fixed comma
         ]
         
         self.settings = QSettings("MyLab", "NapariTools")
@@ -1111,8 +1114,8 @@ def tag_cells(
     layout='vertical'
 )
 def gate_finder(
-    from_gate: int,
-    to_gate:int,
+    from_gate: float,
+    to_gate:float,
     increment: float,
     path_data = Path(),
     marker_of_interest=""
@@ -1135,7 +1138,7 @@ def gate_finder(
         # np.warnings.filterwarnings('ignore')
         np.seterr('ignore')
         dd = np.where(dd > g, 1, dd)
-        dd = pd.DataFrame(dd, index=d.index, columns=['gate-' + str(g)])
+        dd = pd.DataFrame(dd, index=d.index, columns=[marker_of_interest + '_gate-' + str(g)])
         return dd
     
     # Identify the list of increments
@@ -1278,6 +1281,137 @@ def phenotype_cells(
             f"Phenotype calling complete!"
         )
 
+
+
+# -------------------------------------------------------------------------------
+# Rips complex (Improved version - avoids self-intersecting polygons)
+# -------------------------------------------------------------------------------
+
+import numpy as np
+import pandas as pd
+import gudhi as gd
+from magicgui import magicgui
+from pathlib import Path
+import napari
+
+# --- Helper functions ----------------------------------------------------------
+
+def order_polygon_vertices(coords: np.ndarray) -> np.ndarray:
+    """Order polygon vertices counterclockwise based on polar angle."""
+    center = coords.mean(axis=0)
+    angles = np.arctan2(coords[:, 1] - center[1], coords[:, 0] - center[0])
+    return coords[np.argsort(angles)]
+
+def polygon_area(coords: np.ndarray) -> float:
+    """Compute polygon area using the Shoelace formula."""
+    x, y = coords[:, 0], coords[:, 1]
+    return 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+
+
+# --- Main widget ---------------------------------------------------------------
+
+@magicgui(
+    call_button="Build Rips Complex",
+    radius={"label": "Connection radius"},
+    max_dim={"label": "Maximum dimension (1 = edges, 2 = triangles)"},
+)
+def rips_widget(
+    viewer: napari.Viewer,
+    csv_path: Path,
+    radius: float = 20.0,
+    max_dim: int = 2,
+):
+
+    # === 1. Load CSV ===
+    df = pd.read_csv(csv_path)
+    required_cols = {"CellID", "X_centroid", "Y_centroid"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError(f"The CSV must contain the following columns: {required_cols}")
+
+    points = df[["Y_centroid", "X_centroid"]].to_numpy()
+
+    # === 2. Build Rips complex ===
+    rips = gd.RipsComplex(points=points, max_edge_length=radius)
+    st = rips.create_simplex_tree(max_dimension=max_dim)
+
+    simplices = []
+    edges = []
+    triangles = []
+    loops = []
+
+    for simplex, filt in st.get_filtration():
+        dim = len(simplex) - 1
+        if len(set(simplex)) != len(simplex):
+            # skip degenerate simplices with duplicate vertices
+            continue
+
+        cell_ids = ";".join(str(df.iloc[i]["CellID"]) for i in simplex)
+        coords = ";".join(f"({df.iloc[i]['Y_centroid']},{df.iloc[i]['X_centroid']})" for i in simplex)
+
+        simplices.append({
+            "simplex": tuple(simplex),
+            "dimension": dim,
+            "filtration_value": filt,
+            "CellIDs": cell_ids,
+            "coords": coords
+        })
+
+        if dim == 1:
+            edge_coords = points[list(simplex)]
+            edges.append(edge_coords)
+
+        elif dim == 2:
+            tri_coords = points[list(simplex)]
+            tri_coords = order_polygon_vertices(tri_coords)
+            if polygon_area(tri_coords) > 1e-6:  # avoid near-degenerate triangles
+                triangles.append(tri_coords)
+
+        elif dim > 2:
+            loop_coords = points[list(simplex)]
+            loop_coords = order_polygon_vertices(loop_coords)
+            if polygon_area(loop_coords) > 1e-6:
+                loops.append(loop_coords)
+
+    simplices_df = pd.DataFrame(simplices)
+
+    # === 3. Save results ===
+    output_dir = Path(csv_path).parent / "rips_results"
+    output_dir.mkdir(exist_ok=True)
+    base = Path(csv_path).stem
+    out_csv = output_dir / f"{base}_simplices.csv"
+    simplices_df.to_csv(out_csv, index=False)
+
+    print(f"[+] Saved simplices CSV: {out_csv}")
+    print(f"[i] Total simplices generated: {len(simplices_df)}")
+
+    # === 4. Visualization in Napari ===
+
+    # Layer 1: points
+    viewer.add_points(points, name=f"Points_r{radius}", size=5, face_color="yellow")
+
+    # Layer 2: edges
+    if edges:
+        viewer.add_shapes(edges, shape_type="line", edge_color="cyan", name=f"Edges_r{radius}")
+
+    # Layer 3: triangles
+    if triangles:
+        viewer.add_shapes(
+            triangles, shape_type="polygon",
+            edge_color="magenta", face_color="magenta",
+            opacity=0.3, name=f"Triangles_r{radius}"
+        )
+
+    # Layer 4: loops (for higher-order simplices)
+    if loops:
+        viewer.add_shapes(
+            loops, shape_type="polygon",
+            edge_color="red", face_color="red",
+            opacity=0.3, name=f"Loops_r{radius}"
+        )
+
+    return simplices_df
+
+
 # -------------------------------------------------------------------------------
 # Final configuration
 # -------------------------------------------------------------------------------
@@ -1301,7 +1435,8 @@ widget_map = {
     "Extract Cells in Shape": extract_cells_in_shape,
     "Tag cells": tag_cells,
     "Gating": gate_finder,
-    "Run phenotype calling": phenotype_cells
+    "Run phenotype calling": phenotype_cells,
+    "Build Rips Complex": rips_widget
 }
 
 # 2. Define tab configuration
@@ -1309,7 +1444,7 @@ tab_config = {
     "Input": ["Open image", "Open mask", "Load shapes", "Load points"],
     "Analysis": [
         "Count cells", "Metadata", "Voronoi", 
-        "Circle with n cells", "Extract Cells in Shape", "Tag cells", "Gating", "Run phenotype calling"
+        "Circle with n cells", "Extract Cells in Shape", "Tag cells", "Gating", "Run phenotype calling", "Build Rips Complex"
     ],
     "Export": ["Contrast limits", "Save shapes", "Crop ROI", "Save Viewport"],
     "Tools": ["Close all"]
