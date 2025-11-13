@@ -32,6 +32,8 @@ from io import BytesIO
 import re
 from magicgui.widgets import PushButton
 import gudhi as gd
+from shapely.geometry import Point, Polygon
+from napari.layers import Shapes
 
 
 # Initial configuration
@@ -1283,16 +1285,10 @@ def phenotype_cells(
 
 
 
-# -------------------------------------------------------------------------------
-# Rips complex (Improved version - avoids self-intersecting polygons)
-# -------------------------------------------------------------------------------
 
-import numpy as np
-import pandas as pd
-import gudhi as gd
-from magicgui import magicgui
-from pathlib import Path
-import napari
+# -------------------------------------------------------------------------------
+# Rips complex (Improved version - with persistence diagram)
+# -------------------------------------------------------------------------------
 
 # --- Helper functions ----------------------------------------------------------
 
@@ -1307,110 +1303,328 @@ def polygon_area(coords: np.ndarray) -> float:
     x, y = coords[:, 0], coords[:, 1]
     return 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
 
+def get_convex_hull_vertices(points: np.ndarray) -> np.ndarray:
+    """Get convex hull vertices for higher-dimensional simplices."""
+    from scipy.spatial import ConvexHull
+    try:
+        hull = ConvexHull(points)
+        return points[hull.vertices]
+    except:
+        # Fallback: return ordered vertices
+        return order_polygon_vertices(points)
+
+def get_shape_layer_names(widget=None) -> list:
+    """Get available shape layer names from the current viewer."""
+    try:
+        viewer = napari.current_viewer()
+        if viewer is None:
+            return []
+        return [layer.name for layer in viewer.layers 
+                if isinstance(layer, Shapes) and len(layer.data) > 0]
+    except Exception:
+        return []
+
+def filter_cells_in_shape(csv_path: Path, shape_layer_name: str, sample_name: str = None) -> pd.DataFrame:
+    """Filter cells that are within the selected shape."""
+    try:
+        # Load cell data
+        df = pd.read_csv(csv_path)
+        
+        # Verify required columns
+        required_cols = {"CellID", "X_centroid", "Y_centroid"}
+        if not required_cols.issubset(df.columns):
+            raise ValueError(f"CSV must contain columns: {required_cols}")
+        
+        # Filter by sample if provided
+        if sample_name and "Sample" in df.columns:
+            df = df[df["Sample"] == sample_name]
+            if len(df) == 0:
+                raise ValueError(f"No cells found for sample: {sample_name}")
+        
+        # Get the shape layer
+        viewer = napari.current_viewer()
+        if viewer is None:
+            raise ValueError("No Napari viewer available")
+        
+        shape_layer = None
+        for layer in viewer.layers:
+            if layer.name == shape_layer_name and isinstance(layer, Shapes):
+                shape_layer = layer
+                break
+        
+        if shape_layer is None:
+            raise ValueError(f"Shape layer '{shape_layer_name}' not found")
+        
+        if len(shape_layer.data) == 0:
+            raise ValueError("No shapes found in the selected layer")
+        
+        # Use the first shape
+        shape_data = shape_layer.data[0]
+        
+        # Create polygon from shape data - note the coordinate order
+        # Napari uses (row, col) but our data uses (X, Y) = (col, row)
+        polygon = Polygon([(point[1], point[0]) for point in shape_data])
+        
+        # Filter cells within the polygon
+        cells_inside = []
+        for idx, row in df.iterrows():
+            point = Point(row['X_centroid'], row['Y_centroid'])
+            if polygon.contains(point):
+                cells_inside.append(idx)
+        
+        filtered_df = df.loc[cells_inside].copy()
+        
+        if len(filtered_df) == 0:
+            raise ValueError("No cells found within the selected shape")
+        
+        show_info(f"Found {len(filtered_df)} cells within shape")
+        return filtered_df
+        
+    except Exception as e:
+        show_info(f"Error filtering cells: {str(e)}")
+        return pd.DataFrame()
 
 # --- Main widget ---------------------------------------------------------------
 
 @magicgui(
     call_button="Build Rips Complex",
-    radius={"label": "Connection radius"},
-    max_dim={"label": "Maximum dimension (1 = edges, 2 = triangles)"},
+    csv_path={"label": "Cell Data CSV", "mode": "r", "filter": "*.csv"},
+    shape_layer={
+        "label": "Shape Layer", 
+        "choices": get_shape_layer_names
+    },
+    sample_name={
+        "label": "Sample Name (Optional)",
+        "tooltip": "If CSV contains multiple samples, specify which one to use"
+    },
+    radius={"label": "Connection radius", "min": 1.0, "max": 200.0, "step": 1.0},
+    max_dim={"label": "Max dimension", "min": 1, "max": 5, "tooltip": "1=edges, 2=triangles, 3+=higher-dimensional simplices"},
+    output_path={"label": "Output CSV Path", "mode": "w", "filter": "*.csv"},
+    show_points={"label": "Show points", "tooltip": "Display cell centroids"},
+    show_edges={"label": "Show edges", "tooltip": "Display 1-simplices (connections)"},
+    show_triangles={"label": "Show triangles", "tooltip": "Display 2-simplices"},
+    show_loops={"label": "Show loops", "tooltip": "Display higher-dimensional simplices (dimension > 2)"},
+    loop_opacity={"label": "Loop opacity", "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Opacity for higher-dimensional simplices"},
+    generate_persistence_diagram={"label": "Generate Persistence Diagram", "tooltip": "Create and display persistence diagram"}
 )
 def rips_widget(
-    viewer: napari.Viewer,
     csv_path: Path,
+    shape_layer: str,
+    sample_name: str = "",
     radius: float = 20.0,
-    max_dim: int = 2,
-):
+    max_dim: int = 3,
+    output_path: Path = Path("rips_complex_results.csv"),
+    show_points: bool = True,
+    show_edges: bool = True,
+    show_triangles: bool = True,
+    show_loops: bool = True,
+    loop_opacity: float = 0.15,
+    generate_persistence_diagram: bool = True
+) -> pd.DataFrame:
+    """Build Rips complex from cells within a selected shape and save results to specified path."""
+    
+    # === 1. Filter cells within the shape ===
+    filtered_df = filter_cells_in_shape(csv_path, shape_layer, sample_name)
+    if filtered_df.empty:
+        return pd.DataFrame()
 
-    # === 1. Load CSV ===
-    df = pd.read_csv(csv_path)
-    required_cols = {"CellID", "X_centroid", "Y_centroid"}
-    if not required_cols.issubset(df.columns):
-        raise ValueError(f"The CSV must contain the following columns: {required_cols}")
+    # === 2. Prepare points ===
+    points = filtered_df[["Y_centroid", "X_centroid"]].to_numpy()
+    
+    # === 3. Build Rips complex ===
+    try:
+        rips = gd.RipsComplex(points=points, max_edge_length=radius)
+        st = rips.create_simplex_tree(max_dimension=max_dim)
 
-    points = df[["Y_centroid", "X_centroid"]].to_numpy()
+        # Calculate persistence for the diagram
+        persistence = st.persistence()
+        
+        simplices = []
+        edges = []
+        triangles = []
+        loops = []
+        loop_dimensions = []
 
-    # === 2. Build Rips complex ===
-    rips = gd.RipsComplex(points=points, max_edge_length=radius)
-    st = rips.create_simplex_tree(max_dimension=max_dim)
+        for simplex, filt in st.get_filtration():
+            dim = len(simplex) - 1
+            
+            # Skip degenerate simplices
+            if len(set(simplex)) != len(simplex):
+                continue
 
-    simplices = []
-    edges = []
-    triangles = []
-    loops = []
+            # Record simplex information
+            cell_ids = ";".join(str(filtered_df.iloc[i]["CellID"]) for i in simplex)
+            coords = ";".join(
+                f"({filtered_df.iloc[i]['Y_centroid']:.1f},{filtered_df.iloc[i]['X_centroid']:.1f})" 
+                for i in simplex
+            )
 
-    for simplex, filt in st.get_filtration():
-        dim = len(simplex) - 1
-        if len(set(simplex)) != len(simplex):
-            # skip degenerate simplices with duplicate vertices
-            continue
+            simplices.append({
+                "simplex": tuple(simplex),
+                "dimension": dim,
+                "filtration_value": round(filt, 4),
+                "CellIDs": cell_ids,
+                "coords": coords
+            })
 
-        cell_ids = ";".join(str(df.iloc[i]["CellID"]) for i in simplex)
-        coords = ";".join(f"({df.iloc[i]['Y_centroid']},{df.iloc[i]['X_centroid']})" for i in simplex)
+            # Collect geometric representations
+            if dim == 1 and show_edges:
+                edge_coords = points[list(simplex)]
+                edges.append(edge_coords)
 
-        simplices.append({
-            "simplex": tuple(simplex),
-            "dimension": dim,
-            "filtration_value": filt,
-            "CellIDs": cell_ids,
-            "coords": coords
-        })
+            elif dim == 2 and show_triangles:
+                tri_coords = points[list(simplex)]
+                tri_coords = order_polygon_vertices(tri_coords)
+                if polygon_area(tri_coords) > 1e-6:  # Avoid degenerate triangles
+                    triangles.append(tri_coords)
 
-        if dim == 1:
-            edge_coords = points[list(simplex)]
-            edges.append(edge_coords)
+            elif dim >= 3 and show_loops:
+                # For higher-dimensional simplices, create convex hull or ordered polygon
+                loop_coords = points[list(simplex)]
+                try:
+                    # Try to get convex hull for better visualization
+                    hull_coords = get_convex_hull_vertices(loop_coords)
+                    if len(hull_coords) >= 3:  # Need at least 3 points for a polygon
+                        loops.append(hull_coords)
+                        loop_dimensions.append(dim)
+                except:
+                    # Fallback: use ordered vertices
+                    ordered_coords = order_polygon_vertices(loop_coords)
+                    loops.append(ordered_coords)
+                    loop_dimensions.append(dim)
 
-        elif dim == 2:
-            tri_coords = points[list(simplex)]
-            tri_coords = order_polygon_vertices(tri_coords)
-            if polygon_area(tri_coords) > 1e-6:  # avoid near-degenerate triangles
-                triangles.append(tri_coords)
+        simplices_df = pd.DataFrame(simplices)
 
-        elif dim > 2:
-            loop_coords = points[list(simplex)]
-            loop_coords = order_polygon_vertices(loop_coords)
-            if polygon_area(loop_coords) > 1e-6:
-                loops.append(loop_coords)
+    except Exception as e:
+        show_info(f"Error building Rips complex: {str(e)}")
+        return pd.DataFrame()
 
-    simplices_df = pd.DataFrame(simplices)
+    # === 4. Save results ===
+    try:
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        simplices_df.to_csv(output_path, index=False)
+        
+        # Also save the filtered cell data for reference
+        filtered_cells_path = output_path.parent / f"{output_path.stem}_filtered_cells.csv"
+        filtered_df.to_csv(filtered_cells_path, index=False)
+        
+    except Exception as e:
+        show_info(f"Error saving results: {str(e)}")
+        return simplices_df  # Return data even if save fails
 
-    # === 3. Save results ===
-    output_dir = Path(csv_path).parent / "rips_results"
-    output_dir.mkdir(exist_ok=True)
-    base = Path(csv_path).stem
-    out_csv = output_dir / f"{base}_simplices.csv"
-    simplices_df.to_csv(out_csv, index=False)
+    # === 5. Generate Persistence Diagram ===
+    if generate_persistence_diagram:
+        try:
+            # Create persistence diagram
+            plt.figure(figsize=(8, 6))
+            gd.plot_persistence_diagram(persistence)
+            base_name = Path(csv_path).stem
+            plt.title(f"Persistence Diagram: {base_name}\nRadius: {radius}, Max Dim: {max_dim}")
+            
+            # Save the diagram
+            diagram_path = output_path.parent / f"{output_path.stem}_persistence_diagram.png"
+            plt.savefig(diagram_path, dpi=600, bbox_inches='tight')
+            plt.show()  # Display the diagram
+            #plt.close()
+            
+            show_info(f"Persistence diagram saved to: {diagram_path}")
+            
+        except Exception as e:
+            show_info(f"Error generating persistence diagram: {str(e)}")
 
-    print(f"[+] Saved simplices CSV: {out_csv}")
-    print(f"[i] Total simplices generated: {len(simplices_df)}")
+    # === 6. Visualization in Napari ===
+    try:
+        viewer = napari.current_viewer()
+        if not viewer:
+            show_info("No Napari viewer available")
+            return simplices_df
 
-    # === 4. Visualization in Napari ===
+        base_name = f"ShapeROI_r{radius}"
 
-    # Layer 1: points
-    viewer.add_points(points, name=f"Points_r{radius}", size=5, face_color="yellow")
+        # Points layer
+        if show_points and len(points) > 0:
+            viewer.add_points(
+                points, 
+                name=f"{base_name}_Cells", 
+                size=8, 
+                face_color="yellow",
+                edge_color="black",
+                opacity=0.8
+            )
 
-    # Layer 2: edges
-    if edges:
-        viewer.add_shapes(edges, shape_type="line", edge_color="cyan", name=f"Edges_r{radius}")
+        # Edges layer
+        if show_edges and edges:
+            viewer.add_shapes(
+                edges, 
+                shape_type="line", 
+                edge_color="cyan", 
+                edge_width=2,
+                name=f"{base_name}_Connections"
+            )
 
-    # Layer 3: triangles
-    if triangles:
-        viewer.add_shapes(
-            triangles, shape_type="polygon",
-            edge_color="magenta", face_color="magenta",
-            opacity=0.3, name=f"Triangles_r{radius}"
+        # Triangles layer  
+        if show_triangles and triangles:
+            viewer.add_shapes(
+                triangles, 
+                shape_type="polygon",
+                edge_color="magenta", 
+                face_color="magenta",
+                edge_width=1.5,
+                opacity=0.3, 
+                name=f"{base_name}_Triangles"
+            )
+
+        # Loops layer (higher-dimensional simplices)
+        if show_loops and loops:
+            # Create color map based on dimension
+            dimension_colors = {
+                3: [0.2, 0.8, 0.2, loop_opacity],  # Green for 3D
+                4: [0.8, 0.4, 0.0, loop_opacity],  # Orange for 4D  
+                5: [0.6, 0.2, 0.6, loop_opacity],  # Purple for 5D
+            }
+            
+            # Group loops by dimension for better visualization
+            for dim in set(loop_dimensions):
+                dim_loops = [loop for loop, d in zip(loops, loop_dimensions) if d == dim]
+                color = dimension_colors.get(dim, [0.5, 0.5, 0.5, loop_opacity])
+                
+                viewer.add_shapes(
+                    dim_loops,
+                    shape_type="polygon",
+                    edge_color=[c * 0.8 for c in color[:3]] + [1.0],  # Brighter edges
+                    face_color=color,
+                    edge_width=2.0,
+                    name=f"{base_name}_Dim{dim}_Simplices"
+                )
+
+        # Summary information
+        loop_counts = {}
+        for dim in loop_dimensions:
+            loop_counts[dim] = loop_counts.get(dim, 0) + 1
+        
+        loop_info = "\n".join([f"• Dim {dim}: {count} simplices" 
+                              for dim, count in sorted(loop_counts.items())])
+        
+        persistence_info = ""
+        if generate_persistence_diagram:
+            persistence_info = f"• Persistence diagram: {diagram_path.name}\n"
+        
+        show_info(
+            f"Rips complex built successfully!\n"
+            f"• Cells in shape: {len(filtered_df)}\n"
+            f"• Connections: {len(edges)}\n" 
+            f"• Triangles: {len(triangles)}\n"
+            f"• Higher-dimensional simplices:\n{loop_info if loop_counts else '   None'}\n"
+            f"{persistence_info}"
+            f"• Results saved to: {output_path.name}\n"
+            f"• Filtered cells saved to: {filtered_cells_path.name}"
         )
 
-    # Layer 4: loops (for higher-order simplices)
-    if loops:
-        viewer.add_shapes(
-            loops, shape_type="polygon",
-            edge_color="red", face_color="red",
-            opacity=0.3, name=f"Loops_r{radius}"
-        )
+    except Exception as e:
+        show_info(f"Error during visualization: {str(e)}")
 
     return simplices_df
-
 
 # -------------------------------------------------------------------------------
 # Final configuration
