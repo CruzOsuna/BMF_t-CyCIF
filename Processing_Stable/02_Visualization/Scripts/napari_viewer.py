@@ -89,9 +89,8 @@ viewer = napari.Viewer()
 
 
 # -------------------------------------------------------------------------------
-# Widget implementations - Extract Cells in Shape
+# Widget implementations - Open Image
 # -------------------------------------------------------------------------------
-
 
 @magicgui(
     call_button='Open image',
@@ -483,102 +482,6 @@ def voronoi_plot(output_dir: Path, adata_path=Path(), shape_name="", image_name=
 
 
 
-
-# -------------------------------------------------------------------------------
-# Widget implementations - Save Viewport
-# -------------------------------------------------------------------------------
-
-@magicgui(
-    call_button='Save Viewport',
-    layout='vertical',
-    output_dir={"label": "Output Directory", "mode": "d"},
-    filename={"label": "Filename", "tooltip": "Without extension"},
-    image_layer={
-        "label": "Image Layer", 
-        "choices": lambda _: [layer.name for layer in viewer.layers if isinstance(layer, napari.layers.Image)]
-    }
-)
-def save_viewport(
-    output_dir: Path = Path.home(),
-    filename: str = "viewport_snapshot",
-    image_layer: str = None
-):
-    """Save current field of view as TIFF"""
-    try:
-        if not image_layer:
-            show_info("Please select an image layer")
-            return
-            
-        layer = viewer.layers[image_layer]
-        
-        # Get current view parameters
-        view = viewer.window.qt_viewer
-        canvas_size = view.canvas.size
-        camera_zoom = view.camera.zoom
-
-        # Calculate visible area in data coordinates
-        transform = layer._transforms[0:2]  # Get spatial transforms
-        visible_rect = view.camera.rect
-        top_left = transform.inverse(visible_rect.top_left)
-        bottom_right = transform.inverse(visible_rect.bottom_right)
-
-        # Convert to pixel coordinates
-        y_start = int(max(0, top_left[0]))
-        y_end = int(min(layer.data.shape[-2], bottom_right[0]))
-        x_start = int(max(0, top_left[1]))
-        x_end = int(min(layer.data.shape[-1], bottom_right[1]))
-
-        # Handle multiscale images
-        if layer.multiscale:
-            # Calculate optimal pyramid level
-            base_scale = layer.data[0].shape[-2:]
-            scale_factors = [
-                (base_scale[0]/level_data.shape[-2], 
-                base_scale[1]/level_data.shape[-1]
-            ) for level_data in layer.data
-            ]
-            
-            # Find level closest to current zoom
-            target_scale = 1 / camera_zoom
-            level = np.argmin([
-                abs((sf[0] + sf[1])/2 - target_scale) 
-                for sf in scale_factors
-            ])
-            
-            data = layer.data[level]
-            sf_y, sf_x = scale_factors[level]
-
-            # Adjust coordinates for pyramid level
-            y_start = int(y_start / sf_y)
-            y_end = int(y_end / sf_y)
-            x_start = int(x_start / sf_x)
-            x_end = int(x_end / sf_x)
-        else:
-            data = layer.data
-
-        # Extract viewport data with channel handling
-        if data.ndim == 2:
-            viewport = data[y_start:y_end, x_start:x_end]
-        elif data.ndim == 3:  # Handle CYX format
-            viewport = data[:, y_start:y_end, x_start:x_end]
-        elif data.ndim == 4:  # Handle TCYX format
-            viewport = data[0, :, y_start:y_end, x_start:x_end]
-        else:
-            show_info("Unsupported image dimensions")
-            return
-
-        # Save TIFF
-        output_path = output_dir / f"{filename}.tiff"
-        tifffile.imwrite(output_path, viewport)
-        show_info(f"Viewport saved:\n{output_path.name}")
-
-    except Exception as e:
-        show_info(f"Error saving viewport: {str(e)}")
-
-
-
-
-
 # -------------------------------------------------------------------------------
 # Widget implementations - Circle with n cells
 # -------------------------------------------------------------------------------
@@ -759,10 +662,8 @@ def create_circle_widget():
 
 
 
-
-
 # -------------------------------------------------------------------------------
-# Tag cells
+# Widget implementations - Tag cells
 # -------------------------------------------------------------------------------
 
 @magicgui(
@@ -873,7 +774,7 @@ def tag_cells(
     data.to_csv(output_path, index=False)
 
 # -------------------------------------------------------------------------------
-# Gating
+# Widget implementations - Gating
 # -------------------------------------------------------------------------------
 
 @magicgui(
@@ -957,7 +858,7 @@ def gate_finder(
 
 
 # -------------------------------------------------------------------------------
-# Phenotype cells
+# Widget implementations - Phenotype cells
 # -------------------------------------------------------------------------------
 
 @magicgui(
@@ -1052,7 +953,7 @@ def phenotype_cells(
 
 
 # -------------------------------------------------------------------------------
-# Rips complex (Improved version - with persistence diagram)
+# Widget implementations - Rips complex (Improved version - with persistence diagram)
 # -------------------------------------------------------------------------------
 
 # --- Helper functions ----------------------------------------------------------
