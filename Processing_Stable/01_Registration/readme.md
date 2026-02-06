@@ -32,7 +32,7 @@ which ashlar
 ## Configuration
 
 ### Path Setup (Required)
-Edit the following paths in `ashlar_processing.py`:
+Edit the following paths in `stitching.py`:
 
 ```python
 input_path = "/path/to/01_Registration/RCPNL/"           # Raw microscopy files  
