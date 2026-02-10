@@ -45,10 +45,10 @@ class SettingsDialog(QDialog):
         
         self.widget_list = [
             "Open image", "Open mask", "Load shapes",
-            "Contrast limits", "Save shapes",
-            "Count cells", "Metadata",
+            "Contrast limits", "Save shapes", "Crop ROI",
+            "Count cells", "Export cells", "Metadata",
             "Voronoi", "Save Viewport", "Load points", 
-            "Circle with n cells", "Tag cells", 
+            "Circle with n cells", "Extract Cells in Shape","Tag cells", 
             "Gating", "Run phenotype calling", "Build Rips Complex", "Close all"  # Fixed comma
         ]
         
@@ -89,8 +89,9 @@ viewer = napari.Viewer()
 
 
 # -------------------------------------------------------------------------------
-# Widget implementations - Open Image
+# Widget implementations - Extract Cells in Shape
 # -------------------------------------------------------------------------------
+
 
 @magicgui(
     call_button='Open image',
@@ -363,6 +364,34 @@ def save_shapes(output_file: Path, shape_name=""):
 
 
 
+# -------------------------------------------------------------------------------
+# Widget implementations - Extract Cells in Shape
+# -------------------------------------------------------------------------------
+
+
+@magicgui(call_button='Cut and Save ROIs', filepath={"mode": "d"})
+def cut_mask(filepath: Path, shape_name=""):
+    if 'MASK' not in viewer.layers:
+        show_info('No mask layer named "MASK" found')
+        return
+    if shape_name not in viewer.layers:
+        show_info(f'No shape layer named "{shape_name}" found')
+        return
+
+    mask_to_cut = viewer.layers['MASK'].data
+    shape = mask_to_cut.shape
+    selected_area = viewer.layers[shape_name].to_labels(labels_shape=shape)
+    removable_cells = []
+    for i in range(mask_to_cut.shape[0]):
+        for j in range(mask_to_cut.shape[1]):
+            cell = mask_to_cut[i, j]
+            if selected_area[i, j] > 0 and cell not in removable_cells and cell > 0:
+                removable_cells.append(cell)
+    df = pd.DataFrame({'cellid': removable_cells})
+    df = df.astype(int)
+    df.to_csv(filepath / f'{shape_name}_selected_cell_ids.csv', index=False)
+
+
 
 # -------------------------------------------------------------------------------
 # Widget implementations - Close All
@@ -453,6 +482,58 @@ def count_selected_cells(shape_name: str = "", cell_info_csv: Path = Path()):
 
 
 
+
+# -------------------------------------------------------------------------------
+# Widget implementations - Save cells in selected ROI
+# -------------------------------------------------------------------------------
+
+@magicgui(call_button='Save cells in selected ROI', layout='vertical', output_csv={"mode": "d"})
+def save_selected_cells(output_csv: Path, shape_name: str = "", cell_info_csv: Path = Path(), output_file_name: str = ""):
+    if 'MASK' not in viewer.layers:
+        show_info('No mask layer named "MASK" found')
+        return
+    if shape_name not in viewer.layers:
+        show_info(f'No shape layer named "{shape_name}" found')
+        return
+
+    mask_layer = viewer.layers['MASK']
+    mask_data = mask_layer.data
+    shape_layer = viewer.layers[shape_name]
+    shape_data = shape_layer.to_labels(labels_shape=mask_data.shape)
+
+    overlapping_cells = mask_data[shape_data > 0]
+    unique_cells = np.unique(overlapping_cells)
+    unique_cells = unique_cells[unique_cells != 0]
+    cell_count = len(unique_cells)
+
+    show_info(f'Total cells within "{shape_name}": {cell_count}')
+
+    try:
+        cell_info_df = pd.read_csv(cell_info_csv)
+    except Exception as e:
+        show_info(f'Error reading cell information file: {e}')
+        return
+
+    cell_id_column = None
+    for col in ['cellid', 'CellID', 'cell_id', 'Cell_Id', 'cellID']:
+        if col in cell_info_df.columns:
+            cell_id_column = col
+            break
+    if cell_id_column is None:
+        show_info('No cell ID column found in cell information file')
+        return
+
+    selected_cells_info = cell_info_df[cell_info_df[cell_id_column].isin(unique_cells)]
+
+    try:
+        selected_cells_info.to_csv(output_csv / f"{output_file_name}.csv", index=False)
+        show_info(f'Information on {cell_count} selected cells saved in {output_csv}')
+    except Exception as e:
+        show_info(f'Error saving selected cells file: {e}')
+
+
+
+
 # -------------------------------------------------------------------------------
 # Widget implementations - Voronoi plot
 # -------------------------------------------------------------------------------
@@ -480,6 +561,142 @@ def voronoi_plot(output_dir: Path, adata_path=Path(), shape_name="", image_name=
                   overlay_point_alpha=1, legend_size=15, overlay_points_colors=n_colors, colors=n_colors,
                   fileName=f"{file_name}.pdf", saveDir=str(output_dir))
 
+
+
+
+# -------------------------------------------------------------------------------
+# Widget implementations - Save Viewport
+# -------------------------------------------------------------------------------
+
+@magicgui(
+    call_button='Save Viewport',
+    layout='vertical',
+    output_dir={"label": "Output Directory", "mode": "d"},
+    filename={"label": "Filename", "tooltip": "Without extension"},
+    image_layer={
+        "label": "Image Layer", 
+        "choices": lambda _: [layer.name for layer in viewer.layers if isinstance(layer, napari.layers.Image)]
+    }
+)
+def save_viewport(
+    output_dir: Path = Path.home(),
+    filename: str = "viewport_snapshot",
+    image_layer: str = None
+):
+    """Save current field of view as TIFF"""
+    try:
+        if not image_layer:
+            show_info("Please select an image layer")
+            return
+            
+        layer = viewer.layers[image_layer]
+        
+        # Get current view parameters
+        view = viewer.window.qt_viewer
+        canvas_size = view.canvas.size
+        camera_zoom = view.camera.zoom
+
+        # Calculate visible area in data coordinates
+        transform = layer._transforms[0:2]  # Get spatial transforms
+        visible_rect = view.camera.rect
+        top_left = transform.inverse(visible_rect.top_left)
+        bottom_right = transform.inverse(visible_rect.bottom_right)
+
+        # Convert to pixel coordinates
+        y_start = int(max(0, top_left[0]))
+        y_end = int(min(layer.data.shape[-2], bottom_right[0]))
+        x_start = int(max(0, top_left[1]))
+        x_end = int(min(layer.data.shape[-1], bottom_right[1]))
+
+        # Handle multiscale images
+        if layer.multiscale:
+            # Calculate optimal pyramid level
+            base_scale = layer.data[0].shape[-2:]
+            scale_factors = [
+                (base_scale[0]/level_data.shape[-2], 
+                base_scale[1]/level_data.shape[-1]
+            ) for level_data in layer.data
+            ]
+            
+            # Find level closest to current zoom
+            target_scale = 1 / camera_zoom
+            level = np.argmin([
+                abs((sf[0] + sf[1])/2 - target_scale) 
+                for sf in scale_factors
+            ])
+            
+            data = layer.data[level]
+            sf_y, sf_x = scale_factors[level]
+
+            # Adjust coordinates for pyramid level
+            y_start = int(y_start / sf_y)
+            y_end = int(y_end / sf_y)
+            x_start = int(x_start / sf_x)
+            x_end = int(x_end / sf_x)
+        else:
+            data = layer.data
+
+        # Extract viewport data with channel handling
+        if data.ndim == 2:
+            viewport = data[y_start:y_end, x_start:x_end]
+        elif data.ndim == 3:  # Handle CYX format
+            viewport = data[:, y_start:y_end, x_start:x_end]
+        elif data.ndim == 4:  # Handle TCYX format
+            viewport = data[0, :, y_start:y_end, x_start:x_end]
+        else:
+            show_info("Unsupported image dimensions")
+            return
+
+        # Save TIFF
+        output_path = output_dir / f"{filename}.tiff"
+        tifffile.imwrite(output_path, viewport)
+        show_info(f"Viewport saved:\n{output_path.name}")
+
+    except Exception as e:
+        show_info(f"Error saving viewport: {str(e)}")
+
+
+
+
+# -------------------------------------------------------------------------------
+# Widget implementations - Load Points
+# -------------------------------------------------------------------------------
+
+@magicgui(call_button='Load Points', layout='vertical', points_path={"mode": "r", "filter": "*.csv"})
+def load_points(points_path: Path):
+    """Load sampling points layer from CSV"""
+    try:
+        # Read CSV with points data
+        points_df = pd.read_csv(points_path)
+        
+        # Validate required columns
+        if not {'x', 'y'}.issubset(points_df.columns):
+            show_info("CSV must contain 'x' and 'y' columns")
+            return
+
+        # Extract coordinates and optional properties
+        points_data = points_df[['x', 'y']].values
+        properties = {
+            'label': points_df['label'].tolist() if 'label' in points_df.columns else None
+        }
+
+        # Create points layer with optional text labels
+        points_layer = viewer.add_points(
+            points_data,
+            name=points_path.stem,
+            size=10,
+            face_color='magenta',
+            edge_color='black',
+            properties=properties,
+            text='label' if 'label' in points_df.columns else None
+        )
+
+        # Set initial visibility settings
+        points_layer.visible = True
+        show_info(f"Loaded {len(points_data)} points from {points_path.name}")
+
+    except Exception as e:
+        show_info(f"Error loading points: {str(e)}")
 
 
 # -------------------------------------------------------------------------------
@@ -661,9 +878,126 @@ def create_circle_widget():
     return container
 
 
+# -------------------------------------------------------------------------------
+# Widget implementations - Extract Cells in Shape
+# -------------------------------------------------------------------------------
 
 # -------------------------------------------------------------------------------
-# Widget implementations - Tag cells
+# Widget implementation – Extract Cells in Shape (Fast Optimized Version)
+# -------------------------------------------------------------------------------
+
+
+@magicgui(
+    call_button='Extract Cells in Shape',
+    layout='vertical',
+    sample={"label": "Sample Name"},
+    cell_csv={"label": "Cell Data CSV", "mode": "r", "filter": "*.csv"},
+    shape_name={"label": "Shape Layer", "choices": lambda _: [ly.name for ly in viewer.layers if isinstance(ly, Shapes)]},
+    output_mode={"label": "Output Mode", "choices": ["New CSV", "Add label to existing"]},
+    label_column={"label": "Column Name", "visible": False},
+    label_value={"label": "Annotation", "visible": False},
+    output_dir={"label": "Output Directory", "mode": "d"},
+    output_name={"label": "New File Name (Optional)"}
+)
+def extract_cells_in_shape(
+    sample: str,
+    cell_csv: Path,
+    shape_name: str,
+    output_mode: str = "New CSV",
+    label_column: str = "ROI_Label",
+    label_value: str = "Selected",
+    output_dir: Path = Path(),
+    output_name: str = ""
+):
+    """Extract cell data within a drawn shape, using fast polygon-based filtering."""
+    try:
+        # 1️⃣ Validación de entradas
+        if not cell_csv.exists():
+            show_info("Cell CSV file not found")
+            return
+
+        shape_layer = next((ly for ly in viewer.layers if ly.name == shape_name and isinstance(ly, Shapes)), None)
+        if shape_layer is None:
+            show_info(f"Shape layer '{shape_name}' not found")
+            return
+
+        if not shape_layer.selected_data:
+            show_info("Please select a shape in the Shapes layer.")
+            return
+
+        # 2️⃣ Lectura optimizada del CSV
+        use_cols = ['X_centroid', 'Y_centroid', 'CellID', 'Sample']
+        dtypes = {
+            'X_centroid': 'float32',
+            'Y_centroid': 'float32',
+            'CellID': 'int32',
+            'Sample': 'category'
+        }
+        df = pd.read_csv(cell_csv, usecols=use_cols, dtype=dtypes)
+
+        if sample not in df['Sample'].unique():
+            show_info(f"No cells found for sample: {sample}")
+            return
+
+        sample_df = df[df['Sample'] == sample]
+
+        # 3️⃣ Obtener polígono (solo el primero seleccionado)
+        shape_data = shape_layer.data[next(iter(shape_layer.selected_data))]
+        polygon = Polygon(shape_data[:, [1, 0]])  # (x, y) order para Shapely
+
+        # 4️⃣ Verificación de pertenencia vectorizada
+        points = MultiPoint(np.column_stack((sample_df['X_centroid'], sample_df['Y_centroid'])))
+        mask = np.fromiter((polygon.contains(p) for p in points), dtype=bool)
+        filtered_df = sample_df.loc[mask]
+        cell_count = len(filtered_df)
+
+        if cell_count == 0:
+            show_info("No cells found within the specified shape")
+            return
+
+        # 5️⃣ Exportar resultados
+        if output_mode == "New CSV":
+            output_path = output_dir / f"{output_name or f'{sample}_ROI'}.csv"
+            filtered_df.to_csv(output_path, index=False)
+            show_info(f"Saved {cell_count} cells from sample '{sample}' to:\n{output_path}")
+
+        else:  # Add label to existing
+            full_df = pd.read_csv(cell_csv)
+            if label_column not in full_df.columns:
+                full_df[label_column] = ""
+
+            selected_ids = set(filtered_df['CellID'])
+            mask_update = (full_df['Sample'] == sample) & full_df['CellID'].isin(selected_ids)
+            full_df.loc[mask_update, label_column] = label_value
+
+            output_path = output_dir / f"{output_name or cell_csv.stem}_labeled.csv"
+            full_df.to_csv(output_path, index=False)
+            show_info(f"Added label to {cell_count} cells. Saved as:\n{output_path}")
+
+    except Exception as e:
+        show_info(f"Error: {str(e)}")
+
+
+# -------------------------------------------------------------------------------
+# Visibilidad dinámica de parámetros
+# -------------------------------------------------------------------------------
+
+@extract_cells_in_shape.output_mode.changed.connect
+def on_output_mode_changed(output_mode: str):
+    if output_mode == "Add label to existing":
+        extract_cells_in_shape.label_column.show()
+        extract_cells_in_shape.label_value.show()
+    else:
+        extract_cells_in_shape.label_column.hide()
+        extract_cells_in_shape.label_value.hide()
+
+# Estado inicial
+extract_cells_in_shape.label_column.hide()
+extract_cells_in_shape.label_value.hide()
+
+
+# -------------------------------------------------------------------------------
+# Tag cells
 # -------------------------------------------------------------------------------
 
 @magicgui(
@@ -774,7 +1108,7 @@ def tag_cells(
     data.to_csv(output_path, index=False)
 
 # -------------------------------------------------------------------------------
-# Widget implementations - Gating
+# Gating
 # -------------------------------------------------------------------------------
 
 @magicgui(
@@ -858,7 +1192,7 @@ def gate_finder(
 
 
 # -------------------------------------------------------------------------------
-# Widget implementations - Phenotype cells
+# Phenotype cells
 # -------------------------------------------------------------------------------
 
 @magicgui(
@@ -953,7 +1287,7 @@ def phenotype_cells(
 
 
 # -------------------------------------------------------------------------------
-# Widget implementations - Rips complex (Improved version - with persistence diagram)
+# Rips complex (Improved version - with persistence diagram)
 # -------------------------------------------------------------------------------
 
 # --- Helper functions ----------------------------------------------------------
@@ -1303,13 +1637,16 @@ widget_map = {
     "Load shapes": load_shapes,
     "Contrast limits": save_contrast_limits,
     "Save shapes": save_shapes,
+    "Crop ROI": cut_mask,
     "Count cells": count_selected_cells,
+    "Export cells": save_selected_cells,
     "Metadata": view_metadata,
     "Voronoi": voronoi_plot,
     "Load points": load_points,
     "Save Viewport": save_viewport,
     "Close all": close_all,
     "Circle with n cells": create_circle_widget,
+    "Extract Cells in Shape": extract_cells_in_shape,
     "Tag cells": tag_cells,
     "Gating": gate_finder,
     "Run phenotype calling": phenotype_cells,
@@ -1321,9 +1658,9 @@ tab_config = {
     "Input": ["Open image", "Open mask", "Load shapes", "Load points"],
     "Analysis": [
         "Count cells", "Metadata", "Voronoi", 
-        "Circle with n cells", "Tag cells", "Gating", "Run phenotype calling", "Build Rips Complex"
+        "Circle with n cells", "Extract Cells in Shape", "Tag cells", "Gating", "Run phenotype calling", "Build Rips Complex"
     ],
-    "Export": ["Contrast limits", "Save shapes", "Save Viewport"],
+    "Export": ["Contrast limits", "Save shapes", "Crop ROI", "Save Viewport"],
     "Tools": ["Close all"]
 }
 
